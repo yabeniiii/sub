@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "protocol",
+    "firmware",
+    "host",
+]
+resolver = "2"
