@@ -28,10 +28,11 @@ embassy-sync = { version = "0.8" }
 embassy-time = { version = "0.5", features = ["defmt", "defmt-timestamp-uptime"] }
 
 cortex-m = { version = "0.7.7", features = ["critical-section-single-core"] }
-embassy-stm32 = { version = "0.6", features = ["defmt", "stm32f401cc", "unstable-pac", "memory-x", "time-driver-any" ]  }
+embassy-stm32 = { version = "0.6", features = ["exti", "defmt", "stm32f401cc", "unstable-pac", "memory-x", "time-driver-any" ]  }
 heapless = "0.9.3"
 postcard = "1.1.3"
 serde = { version = "1.0", default-features = false }
+static_cell = "2.1.1"
 [profile.release]
 debug = 2
 lto = true
