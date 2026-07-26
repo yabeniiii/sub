@@ -1,29 +1,24 @@
 #![no_std]
 #![no_main]
 
+use core::str::from_utf8;
+
+use crate::managers::comms::ATCommand;
+use crate::managers::comms::ATResponse;
+use crate::managers::comms::CommsManager;
+use crate::managers::comms::CommsManagerPeripherals;
+use defmt::error;
+use defmt::info;
 use embassy_executor::Spawner;
-use embassy_stm32::bind_interrupts;
-use embassy_stm32::peripherals;
-use embassy_stm32::usart::{self, BufferedUart};
 use embassy_time::Timer;
-use embedded_io::Read;
-use embedded_io::ReadReady;
-use embedded_io_async::Write;
-use static_cell::StaticCell;
+
 use {defmt_rtt as _, panic_probe as _};
 
 const SENSOR_NUMBER: usize = 3;
 
-mod actuators;
+// mod actuators;
 mod managers;
-mod sensors;
-
-bind_interrupts!(struct Irqs {
-    USART1 => usart::BufferedInterruptHandler<peripherals::USART1>;
-});
-
-static TX_BUF: StaticCell<[u8; 64]> = StaticCell::new();
-static RX_BUF: StaticCell<[u8; 64]> = StaticCell::new();
+// mod sensors;
 
 // #[embassy_executor::task]
 // async fn sensor_manager_thread() {
@@ -43,41 +38,69 @@ static RX_BUF: StaticCell<[u8; 64]> = StaticCell::new();
 // }
 
 #[embassy_executor::task]
-async fn comms_manager_thread(mut usart: BufferedUart<'static>) {
-    let mut _comms_manager = managers::comms::CommsManager::new();
+async fn comms_manager_thread(p: CommsManagerPeripherals) {
+    let mut manager = CommsManager::new(p).await;
 
-    let _ = usart.write(b"AT\r\n").await;
+    let mut response = [0u8; 128];
+    match manager.send_at(ATCommand::ATE0, &mut response).await {
+        ATResponse::SendError(e) => error!("Send Error for ATE0: {}", e),
+        ATResponse::ReceiveError(e) => error!("Receive Error for AT: {}", e),
+        ATResponse::Ok { bytes } => info!(
+            "response to ATE0: {}",
+            from_utf8(&response[..bytes]).unwrap().trim_ascii()
+        ),
+        ATResponse::Error { bytes } => error!(
+            "error response to ATE0: {}",
+            from_utf8(&response[..bytes]).unwrap().trim_ascii()
+        ),
+        ATResponse::Timeout => {
+            error!("timeout on ATE0");
+            return;
+        }
+    };
 
-    defmt::info!("AT written");
-
-    while !usart.read_ready().unwrap() {}
-
-    let mut buf = [0u8; 1];
-
-    usart.read(&mut buf).unwrap();
-
-    defmt::info!("{}", buf);
-    loop {}
+    match manager.send_at(ATCommand::AT, &mut response).await {
+        ATResponse::SendError(e) => error!("Send Error for AT: {}", e),
+        ATResponse::ReceiveError(e) => error!("Receive Error for AT: {}", e),
+        ATResponse::Ok { bytes } => info!(
+            "response to AT: {}",
+            from_utf8(&response[..bytes]).unwrap().trim_ascii()
+        ),
+        ATResponse::Error { bytes } => error!(
+            "error response to AT: {}",
+            from_utf8(&response[..bytes]).unwrap().trim_ascii()
+        ),
+        ATResponse::Timeout => {
+            error!("timeout on AT");
+            return;
+        }
+    };
 }
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) -> ! {
-    defmt::info!("boot");
     let p = embassy_stm32::init(Default::default());
 
-    let config = usart::Config::default();
+    let _ = Timer::after_secs(1).await;
 
-    let tx_buf = TX_BUF.init([0u8; 64]);
-    let rx_buf = RX_BUF.init([0u8; 64]);
-    let modem_uart =
-        BufferedUart::new(p.USART1, p.PA10, p.PA9, tx_buf, rx_buf, Irqs, config).unwrap();
+    info!("Submarine booting...");
 
-    spawner.spawn(comms_manager_thread(modem_uart).unwrap());
+    spawner.spawn(
+        comms_manager_thread(CommsManagerPeripherals {
+            reset_pin: p.PA8,
+            usart_channel: p.USART1,
+            rx_pin: p.PA10,
+            tx_pin: p.PA9,
+            tx_dma: p.DMA2_CH7,
+            rx_dma: p.DMA2_CH5,
+        })
+        .unwrap(),
+    );
     // spawner.spawn(sensor_manager_thread().unwrap());
     // spawner.spawn(actuator_manager_thread().unwrap());
 
     loop {
-        Timer::after_secs(1).await;
+        Timer::after_secs(10).await;
         defmt::info!("tick");
     }
 }
