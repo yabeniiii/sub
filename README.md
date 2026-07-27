@@ -1,4 +1,4 @@
-# UUUV: Un-named Unmanned Uderwater Vessel
+# UUUV: Un-named Unmanned Underwater Vessel
 early development
 
 a remotely operated submarine
