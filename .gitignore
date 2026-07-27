@@ -110,6 +110,7 @@ buildroot/tmp/
 **/gerber/
 **/drill/
 **/fabrication/
+**/sub-backups/
 
 # 3D viewer cache
 **/*.wrl
