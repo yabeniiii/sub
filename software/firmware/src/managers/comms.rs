@@ -42,7 +42,7 @@ enum AtCommand {
 }
 
 impl AtCommand {
-    fn bytes(&self) -> &'static [u8] {
+    fn encode(&self) -> &'static [u8] {
         match self {
             AtCommand::Ping => b"AT\r\n",
             AtCommand::DisableEcho => b"ATE0\r\n",
@@ -51,7 +51,7 @@ impl AtCommand {
         }
     }
 
-    fn timeout_duration(&self) -> Duration {
+    fn timeout(&self) -> Duration {
         match self {
             AtCommand::Ping => Duration::from_millis(100),
             AtCommand::DisableEcho => Duration::from_millis(100),
@@ -99,13 +99,13 @@ impl<'a> CommsManager<'a> {
 
     async fn send_at<'b>(
         &mut self,
-        command: &AtCommand,
+        command: AtCommand,
         response_buffer: &'b mut [u8],
     ) -> Result<&'b [u8], AtError> {
-        let timeout = command.timeout_duration();
+        let timeout = command.timeout();
 
         self.uart_transmitter
-            .write(command.bytes())
+            .write(command.encode())
             .await
             .map_err(AtError::SendError)?;
 
@@ -129,7 +129,7 @@ impl<'a> CommsManager<'a> {
 
                 if received.ends_with(b"\r\nOK\r\n") || received.ends_with(b">") {
                     match from_utf8(received) {
-                        Ok(resp) => info!("{} returned OK: {}", command, resp.trim_ascii()),
+                        Ok(_) => info!("{} returned OK", command),
                         Err(_) => error!("{} returned non-UTF8 response", command),
                     }
                     return Ok(index);
@@ -175,7 +175,7 @@ impl<'a> CommsManager<'a> {
         let mut response_buf = [0u8; 128];
 
         for command in commands {
-            let _ = self.send_at(&command, &mut response_buf).await?;
+            let _ = self.send_at(command, &mut response_buf).await?;
         }
 
         info!("Modem Configured");
