@@ -1,5 +1,5 @@
 use crate::DMA_BUF;
-
+use core::str::from_utf8;
 use defmt::error;
 use defmt::info;
 use defmt::warn;
@@ -17,9 +17,12 @@ use embassy_time::with_timeout;
 //     Warn(heapless::String<64>),
 // }
 
+#[derive(defmt::Format)]
 pub enum ATCommand {
     AT,
     ATE0,
+    ATCWMODE,
+    ATCWSAP,
 }
 
 impl ATCommand {
@@ -27,6 +30,8 @@ impl ATCommand {
         match self {
             ATCommand::AT => b"AT\r\n",
             ATCommand::ATE0 => b"ATE0\r\n",
+            ATCommand::ATCWMODE => b"AT+CWMODE=2\r\n",
+            ATCommand::ATCWSAP => b"AT+CWSAP=\"ESP_AP\",\"12345678\",5,3\r\n",
         }
     }
 
@@ -34,6 +39,8 @@ impl ATCommand {
         match self {
             ATCommand::AT => Duration::from_millis(100),
             ATCommand::ATE0 => Duration::from_millis(100),
+            ATCommand::ATCWMODE => Duration::from_secs(3),
+            ATCommand::ATCWSAP => Duration::from_secs(3),
         }
     }
 }
@@ -75,6 +82,40 @@ impl<'a> CommsManager<'a> {
         }
     }
 
+    pub async fn configure_modem(&mut self) -> Result<(), ()> {
+        let commands = [
+            ATCommand::ATE0,
+            ATCommand::AT,
+            ATCommand::ATCWMODE,
+            ATCommand::ATCWSAP,
+        ];
+
+        let mut response = [0u8; 128];
+
+        for command in commands {
+            response.fill(0);
+
+            match self.send_at(&command, &mut response).await {
+                ATResponse::BufferFull => error!("Buffer full for {}", &command),
+                ATResponse::SendError(e) => error!("Send error for {}: {}", &command, e),
+                ATResponse::ReceiveError(e) => error!("Receive error for {}: {}", &command, e),
+                ATResponse::Timeout => error!("Timeout on {}", &command),
+                ATResponse::Ok(bytes) => info!(
+                    "Response to {}: {}",
+                    &command,
+                    from_utf8(&response[..bytes]).unwrap().trim_ascii()
+                ),
+                ATResponse::Error(bytes) => error!(
+                    "Error response to {}: {}",
+                    &command,
+                    from_utf8(&response[..bytes]).unwrap().trim_ascii()
+                ),
+            }
+        }
+
+        Ok(())
+    }
+
     // pub fn message(&mut self, message: Message<'a>) {
     //     match message {
     //         Message::Error(message) => {
@@ -91,7 +132,7 @@ impl<'a> CommsManager<'a> {
 
     pub async fn drain_buffer(&mut self) {}
 
-    pub async fn send_at(&mut self, command: ATCommand, response_buffer: &mut [u8]) -> ATResponse {
+    pub async fn send_at(&mut self, command: &ATCommand, response_buffer: &mut [u8]) -> ATResponse {
         let timeout = command.timeout();
 
         if let Err(e) = self.uart_transmitter.write(command.bytes()).await {
@@ -101,6 +142,7 @@ impl<'a> CommsManager<'a> {
         let mut index = 0;
         loop {
             if index >= response_buffer.len() {
+                warn!("Buffer full on AT Response read: {}", command);
                 return ATResponse::BufferFull;
             }
 
@@ -124,4 +166,9 @@ impl<'a> CommsManager<'a> {
             }
         }
     }
+
+    // #[embassy_executor::task]
+    // pub async fn start(&mut self) {
+    //     loop {}
+    // }
 }

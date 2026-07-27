@@ -92,42 +92,7 @@ async fn comms_manager_thread(p: CommsManagerPeripherals) {
     let (tx, rx) = init_modem_uart(p).await;
     let mut manager = CommsManager::new(tx, rx);
 
-    let mut response = [0u8; 128];
-    match manager.send_at(ATCommand::ATE0, &mut response).await {
-        ATResponse::BufferFull => error!("Buffer full"),
-        ATResponse::SendError(e) => error!("Send Error for ATE0: {}", e),
-        ATResponse::ReceiveError(e) => error!("Receive Error for AT: {}", e),
-        ATResponse::Ok(bytes) => info!(
-            "response to ATE0: {}",
-            from_utf8(&response[..bytes]).unwrap().trim_ascii()
-        ),
-        ATResponse::Error(bytes) => error!(
-            "error response to ATE0: {}",
-            from_utf8(&response[..bytes]).unwrap().trim_ascii()
-        ),
-        ATResponse::Timeout => {
-            error!("timeout on ATE0");
-            return;
-        }
-    };
-
-    response.fill(0);
-    match manager.send_at(ATCommand::AT, &mut response).await {
-        ATResponse::BufferFull => error!("Buffer full"),
-        ATResponse::SendError(e) => error!("Send Error for AT: {}", e),
-        ATResponse::ReceiveError(e) => error!("Receive Error for AT: {}", e),
-        ATResponse::Ok(bytes) => info!(
-            "response to AT: {}",
-            from_utf8(&response[..bytes]).unwrap().trim_ascii()
-        ),
-        ATResponse::Error(bytes) => error!(
-            "error response to AT: {}",
-            from_utf8(&response[..bytes]).unwrap().trim_ascii()
-        ),
-        ATResponse::Timeout => {
-            error!("timeout on AT");
-        }
-    };
+    manager.configure_modem();
 }
 
 #[embassy_executor::main]
