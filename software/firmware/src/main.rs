@@ -1,25 +1,15 @@
 #![no_std]
 #![no_main]
 
-use core::str::from_utf8;
-
-use crate::managers::comms::ATCommand;
-use crate::managers::comms::ATResponse;
-use crate::managers::comms::CommsManager;
-use defmt::error;
+use crate::managers::comms;
 use defmt::info;
 use embassy_executor::Spawner;
-use embassy_stm32::Peri;
 use embassy_stm32::bind_interrupts;
 use embassy_stm32::dma;
-use embassy_stm32::gpio;
-use embassy_stm32::mode::Async;
 use embassy_stm32::peripherals;
 use embassy_stm32::usart;
-use embassy_stm32::usart::Uart;
-use embassy_stm32::usart::UartRx;
-use embassy_stm32::usart::UartTx;
 use embassy_time::Timer;
+use static_cell::StaticCell;
 
 use {defmt_rtt as _, panic_probe as _};
 
@@ -31,7 +21,7 @@ bind_interrupts!(struct Irqs {
     DMA2_STREAM5 => dma::InterruptHandler<peripherals::DMA2_CH5>;
 });
 
-static mut DMA_BUF: [u8; 4096] = [0u8; 4096];
+static DMA_BUF: StaticCell<[u8; 4096]> = StaticCell::new();
 
 // mod actuators;
 mod managers;
@@ -54,47 +44,6 @@ mod managers;
 //     loop {}
 // }
 
-struct CommsManagerPeripherals {
-    reset_pin: Peri<'static, peripherals::PA8>,
-    usart_channel: Peri<'static, peripherals::USART1>,
-    rx_pin: Peri<'static, peripherals::PA10>,
-    tx_pin: Peri<'static, peripherals::PA9>,
-    tx_dma: Peri<'static, peripherals::DMA2_CH7>,
-    rx_dma: Peri<'static, peripherals::DMA2_CH5>,
-}
-
-async fn init_modem_uart(
-    p: CommsManagerPeripherals,
-) -> (UartTx<'static, Async>, UartRx<'static, Async>) {
-    let mut reset = gpio::Output::new(p.reset_pin, gpio::Level::High, gpio::Speed::Low);
-
-    reset.toggle();
-    Timer::after_millis(20).await;
-    reset.toggle();
-
-    Timer::after_secs(3).await;
-
-    Uart::new(
-        p.usart_channel,
-        p.rx_pin,
-        p.tx_pin,
-        p.tx_dma,
-        p.rx_dma,
-        Irqs,
-        usart::Config::default(),
-    )
-    .unwrap()
-    .split()
-}
-
-#[embassy_executor::task]
-async fn comms_manager_thread(p: CommsManagerPeripherals) {
-    let (tx, rx) = init_modem_uart(p).await;
-    let mut manager = CommsManager::new(tx, rx);
-
-    manager.configure_modem();
-}
-
 #[embassy_executor::main]
 async fn main(spawner: Spawner) -> ! {
     let p = embassy_stm32::init(Default::default());
@@ -103,7 +52,7 @@ async fn main(spawner: Spawner) -> ! {
 
     info!("Submarine booting...");
 
-    let comms_peripherals = CommsManagerPeripherals {
+    let comms_peripherals = comms::CommsManagerPeripherals {
         reset_pin: p.PA8,
         usart_channel: p.USART1,
         rx_pin: p.PA10,
@@ -112,7 +61,7 @@ async fn main(spawner: Spawner) -> ! {
         rx_dma: p.DMA2_CH5,
     };
 
-    spawner.spawn(comms_manager_thread(comms_peripherals).unwrap());
+    spawner.spawn(comms::comms_manager_thread(comms_peripherals).unwrap());
     // spawner.spawn(sensor_manager_thread().unwrap());
     // spawner.spawn(actuator_manager_thread().unwrap());
 

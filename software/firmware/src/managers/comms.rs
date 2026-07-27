@@ -1,122 +1,89 @@
 use crate::DMA_BUF;
+use crate::Irqs;
 use core::str::from_utf8;
 use defmt::error;
 use defmt::info;
+use defmt::panic;
 use defmt::warn;
+use embassy_stm32::Peri;
+use embassy_stm32::gpio;
 use embassy_stm32::mode::Async;
+use embassy_stm32::peripherals;
 use embassy_stm32::usart;
 use embassy_stm32::usart::RingBufferedUartRx;
+use embassy_stm32::usart::Uart;
 use embassy_stm32::usart::UartRx;
 use embassy_stm32::usart::UartTx;
 use embassy_time::Duration;
+use embassy_time::Timer;
 use embassy_time::with_timeout;
 
-// pub enum Message<'a> {
+// enum Message<'a> {
 //     Error(heapless::String<64>),
 //     Info(heapless::String<64>),
 //     Warn(heapless::String<64>),
 // }
 
-#[derive(defmt::Format)]
-pub enum ATCommand {
-    AT,
-    ATE0,
-    ATCWMODE,
-    ATCWSAP,
+pub struct CommsManagerPeripherals {
+    pub reset_pin: Peri<'static, peripherals::PA8>,
+    pub usart_channel: Peri<'static, peripherals::USART1>,
+    pub rx_pin: Peri<'static, peripherals::PA10>,
+    pub tx_pin: Peri<'static, peripherals::PA9>,
+    pub tx_dma: Peri<'static, peripherals::DMA2_CH7>,
+    pub rx_dma: Peri<'static, peripherals::DMA2_CH5>,
 }
 
-impl ATCommand {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, defmt::Format)]
+enum AtCommand {
+    Ping,
+    DisableEcho,
+    APMode,
+    StartAP,
+}
+
+impl AtCommand {
     fn bytes(&self) -> &'static [u8] {
         match self {
-            ATCommand::AT => b"AT\r\n",
-            ATCommand::ATE0 => b"ATE0\r\n",
-            ATCommand::ATCWMODE => b"AT+CWMODE=2\r\n",
-            ATCommand::ATCWSAP => b"AT+CWSAP=\"ESP_AP\",\"12345678\",5,3\r\n",
+            AtCommand::Ping => b"AT\r\n",
+            AtCommand::DisableEcho => b"ATE0\r\n",
+            AtCommand::APMode => b"AT+CWMODE=2\r\n",
+            AtCommand::StartAP => b"AT+CWSAP=\"ESP_AP\",\"12345678\",5,3\r\n",
         }
     }
 
-    fn timeout(&self) -> Duration {
+    fn timeout_duration(&self) -> Duration {
         match self {
-            ATCommand::AT => Duration::from_millis(100),
-            ATCommand::ATE0 => Duration::from_millis(100),
-            ATCommand::ATCWMODE => Duration::from_secs(3),
-            ATCommand::ATCWSAP => Duration::from_secs(3),
+            AtCommand::Ping => Duration::from_millis(100),
+            AtCommand::DisableEcho => Duration::from_millis(100),
+            AtCommand::APMode => Duration::from_secs(3),
+            AtCommand::StartAP => Duration::from_secs(3),
         }
     }
 }
 
-pub enum ATResponse {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
+enum AtError {
     BufferFull,
     SendError(usart::Error),
     ReceiveError(usart::Error),
-    Ok(usize),
-    Error(usize),
+    CommandError,
     Timeout,
 }
 
-impl ATResponse {
-    fn is_complete(buffer: &[u8]) -> Option<Self> {
-        if buffer.windows(6).any(|w| w == b"\r\nOK\r\n") {
-            Some(Self::Ok(buffer.len()))
-        } else if buffer.windows(9).any(|w| w == b"\r\nERROR\r\n") {
-            Some(Self::Error(buffer.len()))
-        } else {
-            None
-        }
-    }
-}
-
-pub struct CommsManager<'a> {
+struct CommsManager<'a> {
     uart_transmitter: UartTx<'a, Async>,
     uart_receiver: RingBufferedUartRx<'a>,
 }
 
 impl<'a> CommsManager<'a> {
-    pub fn new(tx: UartTx<'a, Async>, rx: UartRx<'a, Async>) -> Self {
-        let mut rx = rx.into_ring_buffered(unsafe { &mut *core::ptr::addr_of_mut!(DMA_BUF) });
-        rx.start_uart();
-
+    fn new(tx: UartTx<'a, Async>, rx: RingBufferedUartRx<'a>) -> Self {
         CommsManager {
             uart_transmitter: tx,
             uart_receiver: rx,
         }
     }
 
-    pub async fn configure_modem(&mut self) -> Result<(), ()> {
-        let commands = [
-            ATCommand::ATE0,
-            ATCommand::AT,
-            ATCommand::ATCWMODE,
-            ATCommand::ATCWSAP,
-        ];
-
-        let mut response = [0u8; 128];
-
-        for command in commands {
-            response.fill(0);
-
-            match self.send_at(&command, &mut response).await {
-                ATResponse::BufferFull => error!("Buffer full for {}", &command),
-                ATResponse::SendError(e) => error!("Send error for {}: {}", &command, e),
-                ATResponse::ReceiveError(e) => error!("Receive error for {}: {}", &command, e),
-                ATResponse::Timeout => error!("Timeout on {}", &command),
-                ATResponse::Ok(bytes) => info!(
-                    "Response to {}: {}",
-                    &command,
-                    from_utf8(&response[..bytes]).unwrap().trim_ascii()
-                ),
-                ATResponse::Error(bytes) => error!(
-                    "Error response to {}: {}",
-                    &command,
-                    from_utf8(&response[..bytes]).unwrap().trim_ascii()
-                ),
-            }
-        }
-
-        Ok(())
-    }
-
-    // pub fn message(&mut self, message: Message<'a>) {
+    // fn message(&mut self, message: Message<'a>) {
     //     match message {
     //         Message::Error(message) => {
     //             error!("{}", message);
@@ -130,45 +97,127 @@ impl<'a> CommsManager<'a> {
     //     }
     // }
 
-    pub async fn drain_buffer(&mut self) {}
+    async fn send_at<'b>(
+        &mut self,
+        command: &AtCommand,
+        response_buffer: &'b mut [u8],
+    ) -> Result<&'b [u8], AtError> {
+        let timeout = command.timeout_duration();
 
-    pub async fn send_at(&mut self, command: &ATCommand, response_buffer: &mut [u8]) -> ATResponse {
-        let timeout = command.timeout();
-
-        if let Err(e) = self.uart_transmitter.write(command.bytes()).await {
-            return ATResponse::SendError(e);
-        }
-
-        let mut index = 0;
-        loop {
-            if index >= response_buffer.len() {
-                warn!("Buffer full on AT Response read: {}", command);
-                return ATResponse::BufferFull;
-            }
-
-            let n = match with_timeout(
-                timeout,
-                self.uart_receiver.read(&mut response_buffer[index..]),
-            )
+        self.uart_transmitter
+            .write(command.bytes())
             .await
-            {
-                Ok(Ok(n)) => n,
-                Ok(Err(e)) => return ATResponse::ReceiveError(e),
-                Err(_) => {
-                    error!("timeout on AT command");
-                    return ATResponse::Timeout;
-                }
-            };
-            index += n;
+            .map_err(AtError::SendError)?;
 
-            if let Some(response) = ATResponse::is_complete(&response_buffer[..index]) {
-                return response;
+        let length = match with_timeout(timeout, async {
+            let mut index = 0;
+            loop {
+                if index >= response_buffer.len() {
+                    warn!("Buffer full on AT Response read: {}", command);
+                    return Err(AtError::BufferFull);
+                }
+
+                let n = self
+                    .uart_receiver
+                    .read(&mut response_buffer[index..])
+                    .await
+                    .map_err(AtError::ReceiveError)?;
+
+                index += n;
+
+                let received = &response_buffer[..index];
+
+                if received.ends_with(b"\r\nOK\r\n") || received.ends_with(b">") {
+                    match from_utf8(received) {
+                        Ok(resp) => info!("{} returned OK: {}", command, resp.trim_ascii()),
+                        Err(_) => error!("{} returned non-UTF8 response", command),
+                    }
+                    return Ok(index);
+                }
+
+                if received.ends_with(b"\r\nERROR\r\n") {
+                    match from_utf8(received) {
+                        Ok(resp) => error!("{} returned ERROR: {}", command, resp.trim_ascii()),
+                        Err(_) => error!("{} returned non-UTF8 response", command),
+                    }
+
+                    return Err(AtError::CommandError);
+                }
             }
-        }
+        })
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                error!("timeout on AT command: {}", command);
+                return Err(AtError::Timeout);
+            }
+        };
+
+        Ok(&response_buffer[..length])
     }
 
-    // #[embassy_executor::task]
-    // pub async fn start(&mut self) {
-    //     loop {}
-    // }
+    /// Configure ESP modem:
+    /// 1. Disable echo
+    /// 2. Verify responsiveness
+    /// 3. Enter AP mode
+    /// 4. Configure AP
+    async fn configure_modem(&mut self) -> Result<(), AtError> {
+        self.uart_receiver.start_uart();
+
+        let commands = [
+            AtCommand::DisableEcho,
+            AtCommand::Ping,
+            AtCommand::APMode,
+            AtCommand::StartAP,
+        ];
+
+        let mut response_buf = [0u8; 128];
+
+        for command in commands {
+            let _ = self.send_at(&command, &mut response_buf).await?;
+        }
+
+        info!("Modem Configured");
+
+        Ok(())
+    }
+}
+
+async fn init_uart(p: CommsManagerPeripherals) -> (UartTx<'static, Async>, UartRx<'static, Async>) {
+    let mut reset = gpio::Output::new(p.reset_pin, gpio::Level::High, gpio::Speed::Low);
+
+    reset.set_low();
+    Timer::after_millis(20).await;
+    reset.set_high();
+
+    Timer::after_secs(3).await;
+
+    match Uart::new(
+        p.usart_channel,
+        p.rx_pin,
+        p.tx_pin,
+        p.tx_dma,
+        p.rx_dma,
+        Irqs,
+        usart::Config::default(),
+    ) {
+        Ok(uart) => {
+            info!("Uart initialised.");
+            uart.split()
+        }
+        Err(e) => panic!("USART initialisation failed: {}", e),
+    }
+}
+
+#[embassy_executor::task]
+pub async fn comms_manager_thread(p: CommsManagerPeripherals) {
+    info!("Starting communication manager...");
+    let dma_buf = DMA_BUF.init([0; 4096]);
+    let (tx, rx) = init_uart(p).await;
+    let mut manager = CommsManager::new(tx, rx.into_ring_buffered(dma_buf));
+
+    if let Err(e) = manager.configure_modem().await {
+        panic!("Modem configuration failed: {}", e);
+    }
 }
