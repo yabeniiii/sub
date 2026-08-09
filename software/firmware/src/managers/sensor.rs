@@ -1,4 +1,11 @@
+use crate::sensors;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
 use heapless::Vec;
+
+struct SensorData {}
+
+static SENSOR_CHANNEL: Channel<CriticalSectionRawMutex, SensorData, 16> = Channel::new();
 
 pub trait Sensor {
     fn read(&self) -> Option<i64> {
@@ -8,7 +15,7 @@ pub trait Sensor {
     fn has_data(&self) -> bool;
 }
 
-pub struct SensorManager<'a> {
+struct SensorManager<'a> {
     sensors: Vec<&'a mut dyn Sensor, { crate::SENSOR_NUMBER }, u8>,
 }
 
@@ -27,4 +34,14 @@ impl<'a> SensorManager<'a> {
             );
         }
     }
+}
+
+#[embassy_executor::task]
+pub async fn sensor_manager_thread() {
+    let mut imu = sensors::imu::Imu::new();
+
+    let mut sensor_manager = SensorManager::new();
+    sensor_manager.add_sensor(&mut imu);
+
+    loop {}
 }

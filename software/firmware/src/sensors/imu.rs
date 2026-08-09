@@ -24,6 +24,6 @@ impl Imu<'_> {
 
 impl Sensor for Imu<'_> {
     fn has_data(&self) -> bool {
-        return !self.buffer.is_empty();
+        !self.buffer.is_empty()
     }
 }
