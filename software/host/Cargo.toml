@@ -5,6 +5,5 @@ edition = "2024"
 
 [dependencies]
 postcard = "1.1.3"
-postcard-rpc = "0.12.1"
 protocol = { path = "../protocol" }
 serde = { version = "1.0.229", features = ["derive"] }
