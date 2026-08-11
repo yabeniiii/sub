@@ -21,8 +21,20 @@ use embassy_time::Timer;
 use embassy_time::with_timeout;
 use embedded_io::ReadReady;
 
+// TODO:
+// Dual defmt/tcp logging.
+//  Need to make it so that any info!, warn!, error!, writes not only to defmt,
+//  but also sends over tcp as a log. obviously i can't see the jtag logging when
+//  it's underwater. Less important in this file
+
+pub static COMMS_READY: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+const MAX_PAYLOAD_SIZE: usize = 1024;
+
 #[embassy_executor::task]
 pub async fn comms_manager_thread(p: CommsManagerPeripherals) {
+    // TODO: switch all panics to use the error manager when that's implemented,
+    // all panics NEED to trigger ascension
     info!("Starting communication manager...");
     let dma_buf = UART_DMA_BUF.init([0; UART_RING_BUFFER_SIZE]);
     let (tx, rx) = init_uart(p).await;
@@ -36,18 +48,47 @@ pub async fn comms_manager_thread(p: CommsManagerPeripherals) {
         if let Err(e) = manager.check_uart().await {
             panic!("UART fetch failed: {}", e);
         }
-        if let Err(e) = manager.send_sensor_data().await {
-            panic!("UART fetch failed: {}", e);
+
+        if let Err(e) = manager.send_data(manager.write_type).await {
+            panic!(
+                "Sending data failed, on data type: {}, with error: {}",
+                manager.write_type, e
+            );
         }
-        if let Err(e) = manager.send_log().await {
-            panic!("UART fetch faile: {}", e);
+        if manager.pending_write.is_none() {
+            manager.write_type.next();
         }
 
         Timer::after_millis(10).await;
     }
 }
 
-pub static COMMS_READY: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+async fn init_uart(p: CommsManagerPeripherals) -> (UartTx<'static, Async>, UartRx<'static, Async>) {
+    info!("Initialising UART...");
+    let mut reset = gpio::Output::new(p.reset_pin, gpio::Level::High, gpio::Speed::Low);
+
+    reset.set_low();
+    Timer::after_millis(20).await;
+    reset.set_high();
+
+    Timer::after_millis(500).await;
+
+    match Uart::new(
+        p.usart_channel,
+        p.rx_pin,
+        p.tx_pin,
+        p.tx_dma,
+        p.rx_dma,
+        Irqs,
+        usart::Config::default(),
+    ) {
+        Ok(uart) => {
+            info!("Uart initialised");
+            uart.split()
+        }
+        Err(e) => panic!("USART initialisation failed: {}", e),
+    }
+}
 
 pub struct CommsManagerPeripherals {
     pub reset_pin: Peri<'static, peripherals::PA8>,
@@ -104,16 +145,41 @@ enum AtError {
     Timeout,
 }
 
+#[derive(PartialEq)]
+enum WritePhase {
+    AwaitingPrompt,
+    PromptReceived,
+}
+
+#[derive(Clone, Copy, PartialEq, defmt::Format)]
 enum WriteType {
     Sensor,
     Log,
+    Error,
+}
+
+impl WriteType {
+    fn next(&mut self) {
+        match self {
+            WriteType::Sensor => *self = WriteType::Log,
+            WriteType::Log => *self = WriteType::Error,
+            WriteType::Error => *self = WriteType::Sensor,
+        }
+    }
+}
+
+struct PendingWrite {
+    kind: WriteType,
+    phase: WritePhase,
+    payload: [u8; MAX_PAYLOAD_SIZE],
+    payload_length: usize,
 }
 
 struct CommsManager<'a> {
     uart_transmitter: UartTx<'a, Async>,
     uart_receiver: RingBufferedUartRx<'a>,
-    tcp_write_ready: bool,
-    tcp_write_type: WriteType,
+    pending_write: Option<PendingWrite>,
+    write_type: WriteType,
     parse_buf: [u8; UART_RING_BUFFER_SIZE],
     parse_len: usize,
 }
@@ -123,69 +189,11 @@ impl<'a> CommsManager<'a> {
         CommsManager {
             uart_transmitter: tx,
             uart_receiver: rx,
-            tcp_write_ready: false,
-            tcp_write_type: WriteType::Log,
+            pending_write: None,
+            write_type: WriteType::Sensor,
             parse_buf: [0u8; UART_RING_BUFFER_SIZE],
             parse_len: 0,
         }
-    }
-
-    async fn send_at(
-        &mut self,
-        command: &mut AtCommand,
-        response_buf: &mut [u8],
-    ) -> Result<(), AtError> {
-        info!("Sending AT Command: {}", command);
-        self.uart_transmitter
-            .write(command.encode())
-            .await
-            .map_err(AtError::SendError)?;
-
-        let _ = match with_timeout(command.timeout(), async {
-            let mut index = 0;
-            loop {
-                if index >= response_buf.len() {
-                    error!("Buffer full on AT Response read: {}", command);
-                    return Err(AtError::BufferFull);
-                }
-
-                let n = self
-                    .uart_receiver
-                    .read(&mut response_buf[index..])
-                    .await
-                    .map_err(AtError::ReceiveError)?;
-
-                index += n;
-
-                let received = &response_buf[..index];
-
-                if received.ends_with(b"\r\nOK\r\n") {
-                    match from_utf8(received) {
-                        Ok(_) => info!("{} returned OK", command),
-                        Err(_) => error!("{} returned non-UTF8 response", command),
-                    }
-                    return Ok(index);
-                }
-
-                if received.ends_with(b"\r\nERROR\r\n") {
-                    match from_utf8(received) {
-                        Ok(resp) => error!("{} returned ERROR: {}", command, resp.trim_ascii()),
-                        Err(_) => error!("{} returned non-UTF8 response", command),
-                    }
-
-                    return Err(AtError::CommandError);
-                }
-            }
-        })
-        .await
-        {
-            Ok(result) => result?,
-            Err(_) => {
-                error!("timeout on AT command: {}", command);
-                return Err(AtError::Timeout);
-            }
-        };
-        Ok(())
     }
 
     async fn configure_modem(&mut self) -> Result<(), AtError> {
@@ -205,14 +213,84 @@ impl<'a> CommsManager<'a> {
         let mut response_buf = [0u8; 128];
 
         for command in &mut commands {
-            if let Err(e) = self.send_at(command, &mut response_buf).await {
+            if let Err(e) = self.send_at(*command, &mut response_buf).await {
                 error!("Error sending AT command: {}, {}", command, e);
+                return Err(e);
             }
         }
 
         info!("Modem Configured");
 
         Ok(())
+    }
+
+    // NOTE: this just blocks until a response arrives. if any URC arrives in
+    // the meantime it will just drop it. be *very* careful where you use this
+    // after initial configuration. at least once, for StartConnection, is
+    // pretty much necessary, but be careful
+    async fn send_at(
+        &mut self,
+        command: AtCommand,
+        response_buf: &mut [u8],
+    ) -> Result<(), AtError> {
+        info!("Sending AT Command: {}", command);
+        self.uart_transmitter
+            .write(command.encode())
+            .await
+            .map_err(AtError::SendError)?;
+
+        match with_timeout(
+            command.timeout(),
+            self.read_at_response(command, response_buf),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                error!("timeout on AT command: {}", command);
+                return Err(AtError::Timeout);
+            }
+        };
+        Ok(())
+    }
+
+    async fn read_at_response(
+        &mut self,
+        command: AtCommand,
+        response_buf: &mut [u8],
+    ) -> Result<usize, AtError> {
+        let mut index = 0;
+        loop {
+            if index >= response_buf.len() {
+                error!("Buffer full on AT Response read: {}", command);
+                return Err(AtError::BufferFull);
+            }
+
+            let n = self
+                .uart_receiver
+                .read(&mut response_buf[index..])
+                .await
+                .map_err(AtError::ReceiveError)?;
+
+            index += n;
+
+            let received = &response_buf[..index];
+
+            if received.ends_with(b"\r\nOK\r\n") {
+                match from_utf8(received) {
+                    Ok(_) => info!("{} returned OK", command),
+                    Err(_) => error!("{} returned non-UTF8 response", command),
+                }
+                return Ok(index);
+            } else if received.ends_with(b"\r\nERROR\r\n") {
+                match from_utf8(received) {
+                    Ok(resp) => error!("{} returned ERROR: {}", command, resp.trim_ascii()),
+                    Err(_) => error!("{} returned non-UTF8 response", command),
+                }
+
+                return Err(AtError::CommandError);
+            }
+        }
     }
 
     async fn check_uart(&mut self) -> Result<(), usart::Error> {
@@ -229,7 +307,7 @@ impl<'a> CommsManager<'a> {
         if self.parse_len >= self.parse_buf.len() {
             error!("parse buffer full, resetting");
             self.parse_len = 0;
-            return Err(usart::Error::Overrun); // or a dedicated variant
+            return Err(usart::Error::Overrun);
         }
 
         loop {
@@ -239,9 +317,15 @@ impl<'a> CommsManager<'a> {
             }
 
             let consumed = if data[0] == b'>' {
-                self.tcp_write_ready = true;
+                if let Some(pw) = &mut self.pending_write {
+                    pw.phase = WritePhase::PromptReceived;
+                } else {
+                    error!("unexpected '>' with no pending write");
+                }
+
                 1
             } else if data.starts_with(b"+IPD,") {
+                // TODO: check length stuff, might overrun parse_buf
                 let Some(colon) = data.iter().position(|&b| b == b':') else {
                     break;
                 };
@@ -255,10 +339,12 @@ impl<'a> CommsManager<'a> {
                 if data.len() < end {
                     break;
                 }
+                // TODO: handle incoming tcp data
                 // dispatch_tcp_data(&data[colon + 1..end]);
                 end
             } else if let Some(eol) = data.windows(2).position(|w| w == b"\r\n") {
-                // dispatch_line(&data[..eol]);
+                // TODO: probably move some of this logic elsewhere
+
                 match from_utf8(&data[..eol]) {
                     Ok(str) => info!("Non-TCP URC arrived: {}", str),
                     Err(_) => info!(
@@ -266,10 +352,11 @@ impl<'a> CommsManager<'a> {
                         data[..eol]
                     ),
                 }
+
                 if data.starts_with(b"+STA_CONNECTED") {
                     let mut response_buf = [0u8; 128];
                     if let Err(e) = self
-                        .send_at(&mut AtCommand::StartConnection, &mut response_buf)
+                        .send_at(AtCommand::StartConnection, &mut response_buf)
                         .await
                     {
                         error!("Connection to server failed: {}", e);
@@ -277,6 +364,7 @@ impl<'a> CommsManager<'a> {
                     }
                     COMMS_READY.signal(());
                 }
+
                 eol + 2
             } else {
                 break;
@@ -289,38 +377,53 @@ impl<'a> CommsManager<'a> {
         Ok(())
     }
 
-    async fn send_sensor_data(&mut self) -> Result<(), usart::Error> {
-        Ok(())
-    }
+    async fn send_data(&mut self, kind: WriteType) -> Result<(), usart::Error> {
+        match &self.pending_write {
+            Some(pw) if pw.kind != kind => return Ok(()),
+            Some(pw) if pw.phase != WritePhase::PromptReceived => return Ok(()),
+            Some(_) => {
+                self.send_bytes().await?;
+            }
+            None => {
+                // grab data from channel if available
+                let _data = match kind {
+                    WriteType::Sensor => (), // TODO: grab from sensor data channel
+                    WriteType::Log => (),    // TODO: grab from log channel
+                    WriteType::Error => (),  // TODO: grab from error channel
+                };
+                // TODO: make sure if the channel is empty, just return
 
-    async fn send_log(&mut self) -> Result<(), usart::Error> {
-        Ok(())
-    }
-}
+                // TODO: serialise data
 
-async fn init_uart(p: CommsManagerPeripherals) -> (UartTx<'static, Async>, UartRx<'static, Async>) {
-    info!("Initialising UART...");
-    let mut reset = gpio::Output::new(p.reset_pin, gpio::Level::High, gpio::Speed::Low);
+                // TODO: init TCP write with cipsend AT command and payload_length
 
-    reset.set_low();
-    Timer::after_millis(20).await;
-    reset.set_high();
-
-    Timer::after_millis(500).await;
-
-    match Uart::new(
-        p.usart_channel,
-        p.rx_pin,
-        p.tx_pin,
-        p.tx_dma,
-        p.rx_dma,
-        Irqs,
-        usart::Config::default(),
-    ) {
-        Ok(uart) => {
-            info!("Uart initialised");
-            uart.split()
+                self.pending_write = Some(PendingWrite {
+                    kind,
+                    phase: WritePhase::AwaitingPrompt,
+                    payload: [0u8; MAX_PAYLOAD_SIZE], // TODO: put serialised data in here
+                    payload_length: 0,                // TODO: and data length here
+                });
+            }
         }
-        Err(e) => panic!("USART initialisation failed: {}", e),
+
+        Ok(())
+    }
+
+    async fn send_bytes(&mut self) -> Result<(), usart::Error> {
+        let Some(pw) = &self.pending_write else {
+            return Ok(());
+        };
+
+        if pw.phase != WritePhase::PromptReceived {
+            return Ok(()); // still waiting on '>'
+        }
+
+        self.uart_transmitter
+            .write(&pw.payload[..pw.payload_length])
+            .await?;
+
+        self.pending_write = None;
+
+        Ok(())
     }
 }
