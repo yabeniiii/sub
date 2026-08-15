@@ -56,6 +56,6 @@ async fn main(spawner: Spawner) -> ! {
     info!("Starting main loop...");
     loop {
         Timer::after_secs(10).await;
-        // defmt::info!("tick");
+        defmt::dbg!("main loop tick");
     }
 }

@@ -15,6 +15,7 @@ use embassy_stm32::usart::Uart;
 use embassy_stm32::usart::UartRx;
 use embassy_stm32::usart::UartTx;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 use embassy_time::Duration;
 use embassy_time::Timer;
@@ -29,12 +30,20 @@ use embedded_io::ReadReady;
 
 pub static COMMS_READY: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
+pub static SENSOR_MESSAGE_QUEUE: Channel<CriticalSectionRawMutex, protocol::SensorData, 16> =
+    Channel::new();
+pub static ERROR_MESSAGE_QUEUE: Channel<CriticalSectionRawMutex, protocol::Log, 16> =
+    Channel::new();
+pub static LOG_MESSAGE_QUEUE: Channel<CriticalSectionRawMutex, protocol::Log, 16> = Channel::new();
+pub static COMMAND_QUEUE: Channel<CriticalSectionRawMutex, protocol::Command, 16> = Channel::new();
+
 const MAX_PAYLOAD_SIZE: usize = 1024;
 
 #[embassy_executor::task]
 pub async fn comms_manager_thread(p: CommsManagerPeripherals) {
     // TODO: switch all panics to use the error manager when that's implemented,
     // all panics NEED to trigger ascension
+    // also the errors in loop probably shouldn't panic
     info!("Starting communication manager...");
     let dma_buf = UART_DMA_BUF.init([0; UART_RING_BUFFER_SIZE]);
     let (tx, rx) = init_uart(p).await;
@@ -48,6 +57,12 @@ pub async fn comms_manager_thread(p: CommsManagerPeripherals) {
         if let Err(e) = manager.check_uart().await {
             panic!("UART fetch failed: {}", e);
         }
+
+        if !COMMS_READY.signaled() {
+            continue;
+        };
+
+        defmt::dbg!("comms loop tick");
 
         if let Err(e) = manager.send_data(manager.write_type).await {
             panic!(
@@ -354,13 +369,14 @@ impl<'a> CommsManager<'a> {
                 }
 
                 if data.starts_with(b"+STA_CONNECTED") {
+                    info!("Device connected to AP");
                     let mut response_buf = [0u8; 128];
                     if let Err(e) = self
                         .send_at(AtCommand::StartConnection, &mut response_buf)
                         .await
                     {
                         error!("Connection to server failed: {}", e);
-                        panic!("Server connection failed, aborting boot...");
+                        // panic!("Server connection failed, aborting boot...");
                     }
                     COMMS_READY.signal(());
                 }
@@ -386,10 +402,25 @@ impl<'a> CommsManager<'a> {
             }
             None => {
                 // grab data from channel if available
-                let _data = match kind {
-                    WriteType::Sensor => (), // TODO: grab from sensor data channel
-                    WriteType::Log => (),    // TODO: grab from log channel
-                    WriteType::Error => (),  // TODO: grab from error channel
+                enum WriteData<'a> {
+                    Sensor(protocol::SensorData),
+                    Log(protocol::Log<'a>),
+                    Error(protocol::Log<'a>),
+                }
+
+                let data = match kind {
+                    WriteType::Sensor => match SENSOR_MESSAGE_QUEUE.try_receive() {
+                        Ok(d) => WriteData::Sensor(d),
+                        Err(_) => return Ok(()),
+                    },
+                    WriteType::Log => match LOG_MESSAGE_QUEUE.try_receive() {
+                        Ok(d) => WriteData::Log(d),
+                        Err(_) => return Ok(()),
+                    },
+                    WriteType::Error => match ERROR_MESSAGE_QUEUE.try_receive() {
+                        Ok(d) => WriteData::Error(d),
+                        Err(_) => return Ok(()),
+                    },
                 };
                 // TODO: make sure if the channel is empty, just return
 
