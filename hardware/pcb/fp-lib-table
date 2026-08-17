@@ -1,0 +1,4 @@
+(fp_lib_table
+  (version 7)
+  (lib (name "STM32F401RCT6")(type "Legacy")(uri "${KIPRJMOD}/lib/KiCad/STM32F401RCT6.mod")(options "")(descr ""))
+)
