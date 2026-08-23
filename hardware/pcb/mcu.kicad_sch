@@ -3693,6 +3693,17 @@
 		)
 		(uuid "8f866044-d400-4666-9b96-240c1a7ec102")
 	)
+	(hierarchical_label "current_sense"
+		(shape input)
+		(at 109.22 107.95 180)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify right)
+		)
+		(uuid "9ef79ffb-3656-4d6e-8b1d-0f285d160db4")
+	)
 	(hierarchical_label "BAT_MON"
 		(shape input)
 		(at 109.22 105.41 180)
