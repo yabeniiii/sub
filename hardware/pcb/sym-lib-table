@@ -1,0 +1,4 @@
+(sym_lib_table
+  (version 7)
+  (lib (name "STM32F401RCT6")(type "KiCad")(uri "${KIPRJMOD}/lib/KiCad/STM32F401RCT6.kicad_sym")(options "")(descr ""))
+)

@@ -1,0 +1,9 @@
+EESchema-DOCLIB  Version 2.0
+#
+$CMP STM32F401RCT6
+D 32-Bit MCU Cortex-M4 256KB 1.8V LQFP64 STMicroelectronics STM32F401RCT6, 32bit ARM Cortex M4 MCU, 84MHz, 256 kB Flash, 64-Pin LQFP
+K
+F https://www.st.com/resource/en/datasheet/stm32f401cb.pdf
+$ENDCMP
+#
+#End Doc Library
