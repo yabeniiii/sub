@@ -1,6 +1,11 @@
 use crate::Irqs;
 use crate::UART_DMA_BUF;
 use crate::UART_RING_BUFFER_SIZE;
+use crate::managers::error::CRITICAL_ERROR_CHANNEL;
+use crate::managers::error::CriticalError;
+use crate::managers::error::ErrorWrap;
+use crate::managers::error::RECOVERABLE_ERROR_CHANNEL;
+use crate::managers::error::RecoverableError;
 use core::str::from_utf8;
 use defmt::error;
 use defmt::info;
@@ -50,7 +55,13 @@ pub async fn comms_manager_thread(p: CommsManagerPeripherals) {
     let mut manager = CommsManager::new(tx, rx.into_ring_buffered(dma_buf));
 
     if let Err(e) = manager.configure_modem().await {
-        panic!("Modem configuration failed: {}", e);
+        CRITICAL_ERROR_CHANNEL
+            .send(CriticalError {
+                message: "Modem configuration failed",
+                error: ErrorWrap::At(e),
+            })
+            .await;
+        core::future::pending::<()>().await;
     }
 
     loop {
@@ -152,7 +163,7 @@ impl AtCommand {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
-enum AtError {
+pub enum AtError {
     BufferFull,
     SendError(usart::Error),
     ReceiveError(usart::Error),
